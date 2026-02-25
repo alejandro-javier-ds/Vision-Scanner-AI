@@ -3,80 +3,92 @@ import logging
 import sys
 import os
 import time
+import pyodbc
 import mediapipe as mp
 from datetime import datetime
 
-CAPTURE_INTERVAL_SECONDS = 5.0
-LOG_DIRECTORY = "audit_logs"
-VAULT_DIRECTORY = "evidence_vault"
+CAPTURE_INTERVAL = 5.0
+VAULT_DIR = "evidence_vault"
+os.makedirs(VAULT_DIR, exist_ok=True)
 
-for directory in [LOG_DIRECTORY, VAULT_DIRECTORY]:
-    os.makedirs(directory, exist_ok=True)
+SQL_CONFIG = (
+    "Driver={ODBC Driver 17 for SQL Server};"
+    "Server=(localdb)\\MSSQLLocalDB;" 
+    "Database=VisionSecurityDB;"
+    "Trusted_Connection=yes;"
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format='[%(levelname)s] %(asctime)s - %(message)s',
     handlers=[
-        logging.FileHandler(f"{LOG_DIRECTORY}/vision_audit_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.FileHandler("audit_logs/vision_audit.log"),
         logging.StreamHandler(sys.stdout)
     ]
 )
 
-def initialize_optical_sensor(target_index: int = 1) -> cv2.VideoCapture:
-    capture_stream = cv2.VideoCapture(target_index)
-    if not capture_stream.isOpened():
-        logging.error(f"Hardware binding failed on port {target_index}.")
-        sys.exit(1)
-    logging.info("Optical sensor synchronization complete.")
-    return capture_stream
+def register_biometric_event(filename: str, absolute_path: str):
+    try:
+        connection = pyodbc.connect(SQL_CONFIG)
+        cursor = connection.cursor()
+        statement = "INSERT INTO BiometricAudit (ImageFilename, ImagePath) VALUES (?, ?)"
+        cursor.execute(statement, (filename, absolute_path))
+        connection.commit()
+        logging.info("SQL_SYNC: Event record committed to BiometricAudit table.")
+        connection.close()
+    except Exception as error:
+        logging.error(f"SQL_ERROR: Synchronization failed. Details: {str(error)}")
 
-def execute_biometric_pipeline(video_stream: cv2.VideoCapture) -> None:
-    logging.info(f"Biometric engine active. Auto-capture interval: {CAPTURE_INTERVAL_SECONDS}s.")
+def run_biometric_service(video_source: cv2.VideoCapture):
+    logging.info("Biometric service initialized. SQL persistence enabled.")
     
     mp_face_mesh = mp.solutions.face_mesh
-    mp_drawing_utils = mp.solutions.drawing_utils
-    render_spec = mp_drawing_utils.DrawingSpec(thickness=1, circle_radius=1, color=(0, 255, 0))
+    mp_drawing = mp.solutions.drawing_utils
+    drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1, color=(0, 255, 0))
     
-    last_capture_timestamp = time.time() - CAPTURE_INTERVAL_SECONDS
+    last_capture_time = time.time() - CAPTURE_INTERVAL
     
-    with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5) as mesh_model:
+    with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True) as mesh:
         while True:
-            frame_status, raw_frame = video_stream.read()
-            if not frame_status:
-                logging.warning("Video stream integrity lost (Frame drop).")
-                break
-                
-            current_timestamp = time.time()
-            rgb_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
-            inference_results = mesh_model.process(rgb_frame)
+            ret, frame = video_source.read()
+            if not ret: break
             
-            if inference_results.multi_face_landmarks:
-                for face_landmarks in inference_results.multi_face_landmarks:
-                    mp_drawing_utils.draw_landmarks(
-                        image=raw_frame,
-                        landmark_list=face_landmarks,
-                        connections=mp_face_mesh.FACEMESH_TESSELATION,
-                        landmark_drawing_spec=render_spec,
-                        connection_drawing_spec=render_spec
+            current_time = time.time()
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = mesh.process(rgb_frame)
+            
+            if results.multi_face_landmarks:
+                for landmarks in results.multi_face_landmarks:
+                    mp_drawing.draw_landmarks(
+                        frame, 
+                        landmarks, 
+                        mp_face_mesh.FACEMESH_TESSELATION, 
+                        drawing_spec, 
+                        drawing_spec
                     )
                 
-                if (current_timestamp - last_capture_timestamp) >= CAPTURE_INTERVAL_SECONDS:
-                    event_hash = datetime.now().strftime('%H%M%S')
-                    evidence_filepath = f"{VAULT_DIRECTORY}/biometric_{event_hash}.jpg"
-                    cv2.imwrite(evidence_filepath, raw_frame)
-                    logging.info(f"Biometric evidence consolidated: {evidence_filepath}")
-                    last_capture_timestamp = current_timestamp
+                if (current_time - last_capture_time) >= CAPTURE_INTERVAL:
+                    timestamp = datetime.now().strftime('%H%M%S')
+                    file_name = f"biometric_cap_{timestamp}.jpg"
+                    file_path = os.path.abspath(f"{VAULT_DIR}/{file_name}")
+                    
+                    cv2.imwrite(file_path, frame)
+                    logging.info(f"IO_SYSTEM: Evidence saved at {file_name}")
+                    
+                    register_biometric_event(file_name, file_path)
+                    last_capture_time = current_time
             
-            cv2.imshow('Vision-Scanner-AI | Active Monitoring', raw_frame)
-            
+            cv2.imshow('Vision-Scanner-AI | Production Environment', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
-                logging.info("Manual interrupt signal received.")
+                logging.info("Service termination requested by user.")
                 break
-                
-    video_stream.release()
+
+    video_source.release()
     cv2.destroyAllWindows()
-    logging.info("Hardware resources released.")
 
 if __name__ == "__main__":
-    sensor_stream = initialize_optical_sensor()
-    execute_biometric_pipeline(sensor_stream)
+    stream = cv2.VideoCapture(1)
+    if stream.isOpened():
+        run_biometric_service(stream)
+    else:
+        logging.error("Hardware error: Failed to bind optical sensor.")

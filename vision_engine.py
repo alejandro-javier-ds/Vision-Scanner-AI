@@ -2,92 +2,81 @@ import cv2
 import logging
 import sys
 import os
+import time
+import mediapipe as mp
 from datetime import datetime
 
-log_dir = "audit_logs"
-evidence_dir = "evidence_vault"
-os.makedirs(log_dir, exist_ok=True)
-os.makedirs(evidence_dir, exist_ok=True)
+CAPTURE_INTERVAL_SECONDS = 5.0
+LOG_DIRECTORY = "audit_logs"
+VAULT_DIRECTORY = "evidence_vault"
 
-log_filename = f"{log_dir}/vision_audit_{datetime.now().strftime('%Y%m%d')}.log"
+for directory in [LOG_DIRECTORY, VAULT_DIRECTORY]:
+    os.makedirs(directory, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format='[%(levelname)s] %(asctime)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_filename),
+        logging.FileHandler(f"{LOG_DIRECTORY}/vision_audit_{datetime.now().strftime('%Y%m%d')}.log"),
         logging.StreamHandler(sys.stdout)
     ]
 )
 
-def initialize_capture_device():
-    target_index = 1 
-    stream_source = cv2.VideoCapture(target_index)
-    
-    if not stream_source.isOpened():
-        logging.error(f"Fallo critico: Interface de video inaccesible en puerto {target_index}.")
+def initialize_optical_sensor(target_index: int = 1) -> cv2.VideoCapture:
+    capture_stream = cv2.VideoCapture(target_index)
+    if not capture_stream.isOpened():
+        logging.error(f"Hardware binding failed on port {target_index}.")
         sys.exit(1)
-        
-    logging.info("Stream optico inicializado. Canal de hardware establecido.")
-    return stream_source
+    logging.info("Optical sensor synchronization complete.")
+    return capture_stream
 
-def execute_native_vision_pipeline(source):
-    logging.info("Motor de inferencia y telemetria activo. Use 'q' para interrumpir.")
+def execute_biometric_pipeline(video_stream: cv2.VideoCapture) -> None:
+    logging.info(f"Biometric engine active. Auto-capture interval: {CAPTURE_INTERVAL_SECONDS}s.")
     
-    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    face_detector = cv2.CascadeClassifier(cascade_path)
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing_utils = mp.solutions.drawing_utils
+    render_spec = mp_drawing_utils.DrawingSpec(thickness=1, circle_radius=1, color=(0, 255, 0))
     
-    target_locked = False
+    last_capture_timestamp = time.time() - CAPTURE_INTERVAL_SECONDS
     
-    while True:
-        status, frame = source.read()
-        
-        if not status:
-            logging.warning("Caida de fotogramas detectada en flujo principal.")
-            break
-        
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detections = face_detector.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-        
-        if len(detections) > 0:
-            if not target_locked:
-                event_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-                logging.info(f"EVENTO DE SEGURIDAD: Objetivo fijado. ID Evento: {event_id}")
+    with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5) as mesh_model:
+        while True:
+            frame_status, raw_frame = video_stream.read()
+            if not frame_status:
+                logging.warning("Video stream integrity lost (Frame drop).")
+                break
                 
-                # Renderizado de telemetria en frame original
-                for (x, y, w, h) in detections:
-                    center_x, center_y = x + w//2, y + h//2
-                    
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cv2.circle(frame, (center_x, center_y), 4, (0, 0, 255), -1)
-                    cv2.line(frame, (center_x - 15, center_y), (center_x + 15, center_y), (0, 255, 0), 1)
-                    cv2.line(frame, (center_x, center_y - 15), (center_x, center_y + 15), (0, 255, 0), 1)
-                    cv2.putText(frame, f'TGT_LOCKED_{event_id}', (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-                # Exportacion de evidencia fotografica
-                evidence_path = f"{evidence_dir}/capture_{event_id}.jpg"
-                cv2.imwrite(evidence_path, frame)
-                logging.info(f"Evidencia visual consolidada en: {evidence_path}")
-                
-                target_locked = True
-                
-            for (x, y, w, h) in detections:
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        else:
-            if target_locked:
-                logging.info("EVENTO DE SEGURIDAD: Objetivo fuera de rango.")
-                target_locked = False
-                
-        cv2.imshow('Vision-Scanner-AI | Interfaz Tactica', frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            logging.info("Protocolo de apagado manual iniciado.")
-            break
+            current_timestamp = time.time()
+            rgb_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+            inference_results = mesh_model.process(rgb_frame)
             
-    source.release()
+            if inference_results.multi_face_landmarks:
+                for face_landmarks in inference_results.multi_face_landmarks:
+                    mp_drawing_utils.draw_landmarks(
+                        image=raw_frame,
+                        landmark_list=face_landmarks,
+                        connections=mp_face_mesh.FACEMESH_TESSELATION,
+                        landmark_drawing_spec=render_spec,
+                        connection_drawing_spec=render_spec
+                    )
+                
+                if (current_timestamp - last_capture_timestamp) >= CAPTURE_INTERVAL_SECONDS:
+                    event_hash = datetime.now().strftime('%H%M%S')
+                    evidence_filepath = f"{VAULT_DIRECTORY}/biometric_{event_hash}.jpg"
+                    cv2.imwrite(evidence_filepath, raw_frame)
+                    logging.info(f"Biometric evidence consolidated: {evidence_filepath}")
+                    last_capture_timestamp = current_timestamp
+            
+            cv2.imshow('Vision-Scanner-AI | Active Monitoring', raw_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                logging.info("Manual interrupt signal received.")
+                break
+                
+    video_stream.release()
     cv2.destroyAllWindows()
-    logging.info("Hardware liberado. Fin de sesion.")
+    logging.info("Hardware resources released.")
 
 if __name__ == "__main__":
-    optical_source = initialize_capture_device()
-    execute_native_vision_pipeline(optical_source)
+    sensor_stream = initialize_optical_sensor()
+    execute_biometric_pipeline(sensor_stream)
